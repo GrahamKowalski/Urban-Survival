@@ -1,4 +1,4 @@
-// index.js - Express + Socket.IO server with all game events
+// index.js - Express + Socket.IO server with procedural maps
 // Place in: server/index.js
 
 const express = require('express');
@@ -19,7 +19,9 @@ const io = new Server(server, {
     origin: '*',
     methods: ['GET', 'POST']
   },
-  transports: ['websocket', 'polling']
+  transports: ['websocket', 'polling'],
+  // Increase max buffer for map data
+  maxHttpBufferSize: 1e7 // 10MB
 });
 
 // Serve static files in production
@@ -86,18 +88,24 @@ io.on('connection', (socket) => {
     const allReady = lobby.players.every(p => p.isHost || p.ready);
     if (!allReady) return;
 
-    // Create game state
+    // Create game state with procedural map
     const gameId = lobbyId;
     const gameState = new GameState(gameId, lobby.players);
     games.set(gameId, gameState);
 
     lobby.status = 'playing';
     
+    // Send game started with full map data
     io.to(lobbyId).emit('gameStarted', {
       gameId,
       players: gameState.getPlayersData(),
       worldSeed: gameState.worldSeed,
-      level: gameState.level
+      level: gameState.level,
+      levelName: gameState.getLevelName(),
+      // NEW: Send full map data for client rendering
+      mapData: gameState.getMapData(),
+      objectives: gameState.getObjectivesData(),
+      lootContainers: gameState.getLootContainersData()
     });
 
     io.emit('lobbiesUpdated', lobbyManager.getPublicLobbies());
@@ -128,6 +136,9 @@ io.on('connection', (socket) => {
           reason: 'All players eliminated',
           stats: game.getGameStats()
         });
+        
+        // Cleanup
+        game.shutdown(); // NEW: Shutdown pathfinding worker
         clearInterval(gameLoop);
         gameLoops.delete(gameId);
         games.delete(gameId);
@@ -135,7 +146,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Broadcast game state
+      // Broadcast game state (includes new data)
       io.to(gameId).emit('gameState', {
         players: game.getPlayersData(),
         enemies: game.getEnemiesData(),
@@ -145,7 +156,10 @@ io.on('connection', (socket) => {
         pings: game.getPingsData(),
         chatMessages: game.getChatMessages(),
         level: game.level,
-        totalKills: game.totalKills
+        totalKills: game.totalKills,
+        // NEW: Send objective and loot container states
+        objectives: game.getObjectivesData(),
+        lootContainerStates: game.getLootContainersData()
       });
 
     }, 1000 / 30); // 30 FPS
@@ -199,106 +213,207 @@ io.on('connection', (socket) => {
     const result = game.handlePlayerDamage(socket.id, damage, player.position, source);
     
     if (result) {
-      if (result.type === 'downed') {
+      if (result.isDowned) {
         io.to(gameId).emit('playerDowned', {
-          playerId: result.playerId,
-          playerName: result.playerName
+          playerId: socket.id,
+          playerName: player.name
         });
-      } else if (result.type === 'damaged') {
+      } else {
         socket.emit('playerDamaged', {
-          playerId: result.playerId,
+          playerId: socket.id,
           damage: result.damage,
           sourcePosition: result.sourcePosition,
-          currentHealth: result.currentHealth
+          currentHealth: result.health
         });
       }
     }
   });
 
-  socket.on('revivePlayer', ({ gameId, targetId, reviverId }) => {
+  socket.on('revivePlayer', ({ gameId, targetId }) => {
     const game = games.get(gameId);
     if (!game) return;
 
-    const result = game.handleRevive(targetId, reviverId);
-    if (result) {
-      io.to(gameId).emit('playerRevived', result);
+    const success = game.revivePlayer(socket.id, targetId);
+    if (success) {
+      const target = game.getPlayerData(targetId);
+      io.to(gameId).emit('playerRevived', {
+        playerId: targetId,
+        playerName: target ? target.name : 'Unknown',
+        reviverId: socket.id
+      });
     }
   });
 
-  socket.on('pickupCollected', ({ gameId, pickupId, playerId }) => {
+  socket.on('pickupCollected', ({ gameId, pickupId }) => {
     const game = games.get(gameId);
     if (!game) return;
 
-    const result = game.collectPickup(pickupId, playerId);
-    if (result) {
-      io.to(gameId).emit('pickupCollected', result);
-    }
-  });
+    const pickup = game.pickups.get(pickupId);
+    if (!pickup) return;
 
-  socket.on('lootContainer', ({ gameId, loot }) => {
-    const game = games.get(gameId);
-    if (!game) return;
-
-    // Spawn the loot as a pickup near the player
     const player = game.getPlayerData(socket.id);
-    if (player) {
-      // Apply loot effect directly
-      const result = {
-        type: loot,
-        playerId: socket.id,
-        playerName: player.name
-      };
-      
-      // Handle weapon loot
-      if (['pistol', 'shotgun', 'smg', 'rifle', 'bat', 'pipe'].includes(loot)) {
-        if (!player.weapons[1]) {
-          player.weapons[1] = loot;
-        } else {
-          player.weapons[1] = loot;
-        }
-        result.effect = { weapon: loot };
-      } else {
-        // Handle consumable loot
-        switch (loot) {
-          case 'ammo':
-            player.ammo += 15;
-            result.effect = { stat: 'ammo', amount: 15 };
-            break;
-          case 'food':
-            player.hunger = Math.min(100, player.hunger + 25);
-            result.effect = { stat: 'hunger', amount: 25 };
-            break;
-          case 'medicine':
-            player.health = Math.min(player.maxHealth, player.health + 20);
-            result.effect = { stat: 'health', amount: 20 };
-            break;
-        }
+    if (!player) return;
+
+    // Apply pickup effect
+    let effect = null;
+    if (['pistol', 'shotgun', 'smg', 'rifle', 'bat', 'pipe'].includes(pickup.type)) {
+      player.weapons[1] = pickup.type;
+      effect = { weapon: pickup.type };
+    } else {
+      switch (pickup.type) {
+        case 'ammo':
+          player.ammo += 15;
+          effect = { stat: 'ammo', amount: 15 };
+          break;
+        case 'food':
+          player.hunger = Math.min(100, player.hunger + 25);
+          effect = { stat: 'hunger', amount: 25 };
+          break;
+        case 'medicine':
+          player.health = Math.min(player.maxHealth, player.health + 20);
+          effect = { stat: 'health', amount: 20 };
+          break;
+        case 'blanket':
+          player.warmth = Math.min(100, player.warmth + 30);
+          effect = { stat: 'warmth', amount: 30 };
+          break;
+        case 'water':
+          player.hunger = Math.min(100, player.hunger + 15);
+          player.energy = Math.min(100, player.energy + 20);
+          effect = { stat: 'water', amount: 15 };
+          break;
       }
-      
-      socket.emit('pickupCollected', result);
+    }
+
+    game.pickups.delete(pickupId);
+
+    io.to(gameId).emit('pickupCollected', {
+      pickupId,
+      playerId: socket.id,
+      playerName: player.name,
+      type: pickup.type,
+      effect
+    });
+  });
+
+  // NEW: Loot container interaction
+  socket.on('lootContainer', ({ gameId, containerId }) => {
+    const game = games.get(gameId);
+    if (!game) return;
+
+    const loot = game.lootContainer(socket.id, containerId);
+    
+    io.to(gameId).emit('containerLooted', {
+      containerId,
+      playerId: socket.id,
+      loot
+    });
+  });
+
+  // NEW: Collect objective item
+  socket.on('collectObjective', ({ gameId, objectiveId }) => {
+    const game = games.get(gameId);
+    if (!game) return;
+
+    const success = game.collectObjective(socket.id, objectiveId);
+    
+    if (success) {
+      io.to(gameId).emit('objectiveCollected', {
+        objectiveId,
+        playerId: socket.id,
+        objectives: game.getObjectivesData()
+      });
     }
   });
 
-  socket.on('perkSelected', ({ gameId, playerId, perkId }) => {
+  // NEW: Player trying to escape
+  socket.on('attemptEscape', ({ gameId }) => {
     const game = games.get(gameId);
     if (!game) return;
 
-    game.applyPerk(playerId, perkId);
-  });
+    const objectives = game.getObjectivesData();
+    
+    if (objectives.escapeActive) {
+      const player = game.getPlayerData(socket.id);
+      if (!player) return;
 
-  socket.on('ping', ({ gameId, playerId, position }) => {
-    const game = games.get(gameId);
-    if (!game) return;
+      // Check if player is in escape zone
+      const escapeZone = objectives.escapeZone;
+      const dx = player.position.x - escapeZone.position.x;
+      const dz = player.position.z - escapeZone.position.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
 
-    const ping = game.addPing(playerId, position);
-    if (ping) {
-      io.to(gameId).emit('ping', ping);
+      if (dist <= escapeZone.radius) {
+        // Player escaped successfully!
+        io.to(gameId).emit('playerEscaped', {
+          playerId: socket.id,
+          playerName: player.name
+        });
+
+        // Check if all alive players escaped
+        // For now, just end the game on first escape
+        io.to(gameId).emit('gameOver', {
+          reason: 'Escaped successfully!',
+          stats: game.getGameStats(),
+          victory: true
+        });
+
+        game.shutdown();
+        const gameLoop = gameLoops.get(gameId);
+        if (gameLoop) {
+          clearInterval(gameLoop);
+          gameLoops.delete(gameId);
+        }
+        games.delete(gameId);
+        lobbyManager.deleteLobby(gameId);
+      }
     }
   });
 
-  socket.on('glassBreak', ({ gameId, position }) => {
+  socket.on('perkSelected', ({ gameId, perkId }) => {
     const game = games.get(gameId);
     if (!game) return;
+
+    const player = game.getPlayerData(socket.id);
+    if (!player) return;
+
+    // Add perk if not already have it
+    if (!player.perks.find(p => p.id === perkId)) {
+      player.perks.push({ id: perkId });
+      socket.emit('perkApplied', { perkId });
+    }
+  });
+
+  socket.on('ping', ({ gameId, position, type }) => {
+    const game = games.get(gameId);
+    if (!game) return;
+
+    const player = game.getPlayerData(socket.id);
+    if (!player) return;
+
+    const ping = {
+      id: require('uuid').v4(),
+      playerId: socket.id,
+      playerName: player.name,
+      playerColor: player.color,
+      position,
+      type: type || 'default',
+      createdAt: Date.now()
+    };
+
+    game.pings.push(ping);
+    io.to(gameId).emit('ping', ping);
+  });
+
+  // NEW: Glass break with map tracking
+  socket.on('glassBreak', ({ gameId, glassId, position }) => {
+    const game = games.get(gameId);
+    if (!game) return;
+
+    // Update glass state
+    if (glassId) {
+      game.breakGlass(glassId);
+    }
 
     // Alert nearby enemies
     for (const enemy of game.enemies.values()) {
@@ -315,6 +430,8 @@ io.on('connection', (socket) => {
         });
       }
     }
+
+    io.to(gameId).emit('glassBroken', { glassId, position });
   });
 
   // Chat message handling
@@ -353,6 +470,7 @@ io.on('connection', (socket) => {
 
         // End game if no players left
         if (game.getPlayerCount() === 0) {
+          game.shutdown(); // NEW: Cleanup pathfinding
           const gameLoop = gameLoops.get(gameId);
           if (gameLoop) {
             clearInterval(gameLoop);

@@ -1,10 +1,11 @@
-// Game.jsx - With chat/combat log, enemy targeting, and identity display
+// Game.jsx - Complete reimplementation with procedural map system
 // Place in: client/src/components/Game.jsx
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import audioManager from '../game/AudioManager';
 import HUD from './HUD';
+import { MapRenderer } from '../game/MapRenderer';
 
 const WEAPON_STATS = {
   knife: { damage: 35, range: 2.5, cooldown: 20, type: 'melee' },
@@ -43,21 +44,11 @@ const PICKUP_CONFIG = {
   pipe: { color: 0x696969, icon: '🔧', name: 'Pipe' }
 };
 
-const LEVEL_NAMES = ['Skid Row', 'The Tunnels', 'Industrial Wasteland', 'The Camps', 'Downtown Ruins', 'The Depths'];
-
-const THEMES = {
-  normal: { name: 'Urban Decay', fog: 0x2a2a2a, sky: 0x1a1a1a, ground: 0x3a3a3a, building: 0x4a4a4a, ambient: 0x404040, ambientIntensity: 0.4, dirLight: 0xffffff, dirIntensity: 0.5, flicker: 0xffaa44 },
-  night: { name: 'Midnight', fog: 0x0a0a1a, sky: 0x050510, ground: 0x1a1a2a, building: 0x2a2a3a, ambient: 0x202040, ambientIntensity: 0.25, dirLight: 0x6666aa, dirIntensity: 0.3, flicker: 0x4444ff },
-  wasteland: { name: 'Wasteland', fog: 0x4a3a2a, sky: 0x3a2a1a, ground: 0x5a4a3a, building: 0x6a5a4a, ambient: 0x806040, ambientIntensity: 0.5, dirLight: 0xffcc88, dirIntensity: 0.6, flicker: 0xff6600 },
-  frozen: { name: 'Frozen', fog: 0x8090a0, sky: 0x405060, ground: 0x607080, building: 0x506070, ambient: 0x8090a0, ambientIntensity: 0.5, dirLight: 0xaaccff, dirIntensity: 0.6, flicker: 0x66aaff },
-  hell: { name: 'Inferno', fog: 0x2a1010, sky: 0x1a0505, ground: 0x3a2020, building: 0x4a2a2a, ambient: 0x802020, ambientIntensity: 0.4, dirLight: 0xff4444, dirIntensity: 0.4, flicker: 0xff2200 },
-  toxic: { name: 'Toxic', fog: 0x1a2a1a, sky: 0x0a1a0a, ground: 0x2a3a2a, building: 0x3a4a3a, ambient: 0x40a040, ambientIntensity: 0.35, dirLight: 0x88ff88, dirIntensity: 0.4, flicker: 0x00ff44 }
-};
-
 function Game({ socket, gameData, playerId, playerName, onQuit }) {
   const mountRef = useRef(null);
   const gameRef = useRef(null);
   const sceneRef = useRef(null);
+  const mapRendererRef = useRef(null);
   const hudUpdateRef = useRef(null);
   const chatInputRef = useRef(null);
   
@@ -70,13 +61,13 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
   const [chatInput, setChatInput] = useState('');
   const [isChatFocused, setIsChatFocused] = useState(false);
   const [targetedEnemy, setTargetedEnemy] = useState(null);
+  const [objectives, setObjectives] = useState({ items: [], escapeActive: false });
   
   const [settings, setSettings] = useState({
     masterVolume: 0.6,
     musicVolume: 0.25,
     sfxVolume: 0.5,
-    brightness: 1.0,
-    theme: 'normal'
+    brightness: 1.0
   });
 
   useEffect(() => {
@@ -84,21 +75,6 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
     if (audioManager.musicGain) audioManager.musicGain.gain.value = settings.musicVolume;
     if (audioManager.sfxGain) audioManager.sfxGain.gain.value = settings.sfxVolume;
   }, [settings.masterVolume, settings.musicVolume, settings.sfxVolume]);
-
-  useEffect(() => {
-    if (!sceneRef.current) return;
-    const { scene, ambientLight, dirLight, flickerLights, ground, buildings } = sceneRef.current;
-    const theme = THEMES[settings.theme];
-    scene.fog.color.setHex(theme.fog);
-    scene.background.setHex(theme.sky);
-    ambientLight.color.setHex(theme.ambient);
-    ambientLight.intensity = theme.ambientIntensity * settings.brightness;
-    dirLight.color.setHex(theme.dirLight);
-    dirLight.intensity = theme.dirIntensity * settings.brightness;
-    ground.material.color.setHex(theme.ground);
-    buildings.forEach(b => b.material.color.setHex(theme.building));
-    flickerLights.forEach(l => l.color.setHex(theme.flicker));
-  }, [settings.theme, settings.brightness]);
 
   const handleSelectPerk = useCallback((perk) => {
     if (!gameRef.current) return;
@@ -129,96 +105,44 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
     if (!gameData || !mountRef.current) return;
     const mount = mountRef.current;
 
-    const scene = new THREE.Scene();
-    const theme = THEMES[settings.theme];
-    scene.fog = new THREE.Fog(theme.fog, 15, 70);
-    scene.background = new THREE.Color(theme.sky);
+    // Get map data from gameData (sent by server on gameStarted)
+    const mapData = gameData.mapData;
+    if (!mapData) {
+      console.error('[Game] No map data received from server!');
+      return;
+    }
 
+    const scene = new THREE.Scene();
+    
+    // Create camera
     const camera = new THREE.PerspectiveCamera(75, mount.clientWidth / mount.clientHeight, 0.1, 1000);
+    
+    // Create renderer
     const renderer = new THREE.WebGLRenderer({ antialias: false });
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.BasicShadowMap;
     mount.appendChild(renderer.domElement);
 
-    const ambientLight = new THREE.AmbientLight(theme.ambient, theme.ambientIntensity * settings.brightness);
-    scene.add(ambientLight);
-    
-    const dirLight = new THREE.DirectionalLight(theme.dirLight, theme.dirIntensity * settings.brightness);
-    dirLight.position.set(10, 20, 10);
-    dirLight.castShadow = true;
-    dirLight.shadow.mapSize.width = 1024;
-    dirLight.shadow.mapSize.height = 1024;
-    scene.add(dirLight);
+    // Initialize map renderer with procedural map data
+    mapRendererRef.current = new MapRenderer(scene, mapData);
+    const mapObjects = mapRendererRef.current.render();
 
-    const flickerLights = [];
-    for (let i = 0; i < 6; i++) {
-      const light = new THREE.PointLight(theme.flicker, 0.4, 12);
-      light.position.set((Math.random() - 0.5) * 70, 3, (Math.random() - 0.5) * 70);
-      light.userData = { base: 0.3 + Math.random() * 0.2, speed: 0.05 + Math.random() * 0.1, phase: Math.random() * Math.PI * 2 };
-      scene.add(light);
-      flickerLights.push(light);
+    // Store scene references
+    sceneRef.current = { 
+      scene, 
+      mapObjects,
+      bounds: mapData.bounds
+    };
+
+    // Adjust brightness based on settings
+    if (mapObjects.lights) {
+      mapObjects.lights.forEach(light => {
+        if (light.intensity) light.intensity *= settings.brightness;
+      });
     }
 
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(150, 150), new THREE.MeshLambertMaterial({ color: theme.ground }));
-    ground.rotation.x = -Math.PI / 2;
-    ground.receiveShadow = true;
-    scene.add(ground);
-
-    const seed = gameData.worldSeed;
-    const seededRandom = (n) => { const x = Math.sin(seed * n) * 10000; return x - Math.floor(x); };
-
-    const buildings = [];
-    for (let i = 0; i < 25; i++) {
-      const x = (seededRandom(i * 3) - 0.5) * 110;
-      const z = (seededRandom(i * 3 + 1) - 0.5) * 110;
-      if (Math.abs(x) > 10 || Math.abs(z) > 10) {
-        const height = 5 + seededRandom(i * 3 + 2) * 12;
-        const building = new THREE.Mesh(new THREE.BoxGeometry(3 + seededRandom(i * 7) * 4, height, 3 + seededRandom(i * 11) * 4), new THREE.MeshLambertMaterial({ color: theme.building }));
-        building.position.set(x, height / 2, z);
-        building.castShadow = true;
-        scene.add(building);
-        buildings.push(building);
-      }
-    }
-
-    sceneRef.current = { scene, ambientLight, dirLight, flickerLights, ground, buildings };
-
-    const firePits = [];
-    for (let i = 0; i < 5; i++) {
-      const x = (seededRandom(i * 17 + 200) - 0.5) * 70;
-      const z = (seededRandom(i * 19 + 200) - 0.5) * 70;
-      const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 1, 8), new THREE.MeshLambertMaterial({ color: 0x333333 }));
-      barrel.position.set(x, 0.5, z);
-      scene.add(barrel);
-      const fireLight = new THREE.PointLight(0xff4400, 1, 8);
-      fireLight.position.set(x, 1.5, z);
-      scene.add(fireLight);
-      firePits.push({ position: new THREE.Vector3(x, 0, z), light: fireLight });
-    }
-
-    const glassZones = [];
-    for (let i = 0; i < 8; i++) {
-      const x = (seededRandom(i * 23 + 300) - 0.5) * 80;
-      const z = (seededRandom(i * 29 + 300) - 0.5) * 80;
-      const glass = new THREE.Mesh(new THREE.PlaneGeometry(3, 3), new THREE.MeshLambertMaterial({ color: 0x88ccff, transparent: true, opacity: 0.3 }));
-      glass.rotation.x = -Math.PI / 2;
-      glass.position.set(x, 0.01, z);
-      scene.add(glass);
-      glassZones.push({ position: new THREE.Vector3(x, 0, z), radius: 1.5, broken: false, mesh: glass });
-    }
-
-    const lootContainers = [];
-    for (let i = 0; i < 12; i++) {
-      const x = (seededRandom(i * 31 + 400) - 0.5) * 90;
-      const z = (seededRandom(i * 37 + 400) - 0.5) * 90;
-      const container = new THREE.Mesh(new THREE.BoxGeometry(2, 1.5, 1.2), new THREE.MeshLambertMaterial({ color: 0x2a4a2a }));
-      container.position.set(x, 0.75, z);
-      container.userData = { looted: false, loot: ['ammo', 'food', 'medicine', 'pistol', 'shotgun'][Math.floor(seededRandom(i * 41 + 400) * 5)] };
-      scene.add(container);
-      lootContainers.push(container);
-    }
-
+    // Create gun model
     const gunGroup = new THREE.Group();
     const createGunModel = (type) => {
       while (gunGroup.children.length) gunGroup.remove(gunGroup.children[0]);
@@ -255,6 +179,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
     const raycaster = new THREE.Raycaster();
     raycaster.far = 50;
 
+    // Game state
     const game = {
       position: new THREE.Vector3(0, 1.6, 0),
       yaw: 0, pitch: 0,
@@ -265,8 +190,8 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
       activeSlot: 0,
       isDowned: false,
       reviveProgress: 0,
-      speedMult: 1, damageMult: 1, meleeMult: 1, radarRange: 30,
-      level: 1, levelName: LEVEL_NAMES[0],
+      speedMult: 1, damageMult: 1, meleeMult: 1, radarRange: 50,
+      level: 1, levelName: mapData.area?.name || 'Skid Row',
       allPlayers: [],
       selectedPerks: [],
       notifications: [],
@@ -275,18 +200,37 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
       minimapData: { enemies: [], pickups: [], players: [], pings: [] },
       showLevelUp: false,
       enemies: new Map(),
-      targetedEnemyId: null
+      targetedEnemyId: null,
+      isInsideBuilding: false,
+      objectives: { items: [], escapeActive: false, escapeZone: null },
+      lootContainerStates: new Map()
     };
 
+    // Initialize player position from server data
     const myData = gameData.players.find(p => p.id === playerId);
     if (myData) game.position.set(myData.position.x, myData.position.y, myData.position.z);
     gameRef.current = game;
 
+    // Initialize objectives from server data
+    if (gameData.objectives) {
+      game.objectives = gameData.objectives;
+      setObjectives(gameData.objectives);
+    }
+
+    // Initialize loot container states
+    if (gameData.lootContainers) {
+      gameData.lootContainers.forEach(container => {
+        game.lootContainerStates.set(container.id, container);
+      });
+    }
+
+    // Mesh management
     const playerMeshes = new Map();
     const enemyMeshes = new Map();
     const pickupMeshes = new Map();
     const bulletMeshes = new Map();
     const pingMeshes = new Map();
+    const objectiveMeshes = new Map();
 
     const playerBodyGeo = new THREE.CylinderGeometry(0.3, 0.35, 1.2, 8);
     const headGeo = new THREE.SphereGeometry(0.2, 8, 8);
@@ -294,6 +238,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
     const bulletGeo = new THREE.SphereGeometry(0.08, 6, 6);
     const bulletMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
 
+    // Input handling
     const keys = {};
     let shootCooldown = 0;
     let meleeCooldown = 0;
@@ -302,8 +247,153 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
     let perkSelectionOpen = false;
     let chatFocused = false;
 
+    // Simple client-side collision check using building data
+    const checkCollision = (x, z) => {
+      const bounds = mapData.bounds;
+      // Check map bounds
+      if (x < bounds.minX + 1 || x > bounds.maxX - 1 || z < bounds.minZ + 1 || z > bounds.maxZ - 1) {
+        return true;
+      }
+      
+      // Check buildings
+      for (const building of mapData.buildings) {
+        const halfW = building.dimensions.width / 2;
+        const halfD = building.dimensions.depth / 2;
+        const bx = building.position.x;
+        const bz = building.position.z;
+        
+        // Simple AABB collision
+        if (x >= bx - halfW - 0.4 && x <= bx + halfW + 0.4 &&
+            z >= bz - halfD - 0.4 && z <= bz + halfD + 0.4) {
+          
+          // Check if building has accessible interior
+          if (building.hasInterior) {
+            // Find the interior data
+            const interior = mapData.interiors.find(i => i.buildingId === building.id);
+            if (interior && !interior.door.barricaded) {
+              // Allow entry through door
+              const door = interior.door;
+              const doorRadius = 1.5;
+              const distToDoor = Math.sqrt(Math.pow(x - door.position.x, 2) + Math.pow(z - door.position.z, 2));
+              if (distToDoor < doorRadius) {
+                return false; // Can pass through door
+              }
+            }
+          }
+          return true;
+        }
+      }
+      
+      // Check overpass pillars
+      for (const overpass of mapData.overpasses) {
+        for (const pillar of overpass.pillars) {
+          const dist = Math.sqrt(Math.pow(x - pillar.position.x, 2) + Math.pow(z - pillar.position.z, 2));
+          if (dist < 1.5) return true;
+        }
+      }
+      
+      // Check large vehicles
+      for (const prop of mapData.props) {
+        if (prop.type === 'vehicle') {
+          const size = prop.subtype === 'bus' ? 5 : prop.subtype === 'truck' ? 3 : 2;
+          const dx = Math.abs(x - prop.position.x);
+          const dz = Math.abs(z - prop.position.z);
+          if (dx < size + 0.4 && dz < 1.5 + 0.4) return true;
+        } else if (prop.type === 'dumpster') {
+          const dx = Math.abs(x - prop.position.x);
+          const dz = Math.abs(z - prop.position.z);
+          if (dx < 1.5 + 0.4 && dz < 1 + 0.4) return true;
+        }
+      }
+      
+      return false;
+    };
+
+    // Move with collision and wall sliding
+    const moveWithCollision = (currentX, currentZ, desiredX, desiredZ) => {
+      // Try full movement first
+      if (!checkCollision(desiredX, desiredZ)) {
+        return { x: desiredX, z: desiredZ };
+      }
+      
+      // Try X-only movement (slide along Z wall)
+      if (!checkCollision(desiredX, currentZ)) {
+        return { x: desiredX, z: currentZ };
+      }
+      
+      // Try Z-only movement (slide along X wall)
+      if (!checkCollision(currentX, desiredZ)) {
+        return { x: currentX, z: desiredZ };
+      }
+      
+      // Can't move at all
+      return { x: currentX, z: currentZ };
+    };
+
+    // Check if position is inside a building interior
+    const checkInsideBuilding = (x, z) => {
+      for (const interior of mapData.interiors) {
+        if (x >= interior.bounds.minX && x <= interior.bounds.maxX &&
+            z >= interior.bounds.minZ && z <= interior.bounds.maxZ) {
+          return interior;
+        }
+      }
+      return null;
+    };
+
+    // Check if near a barrel fire (for warmth)
+    const checkNearBarrelFire = (x, z) => {
+      for (const fire of mapData.barrelFires) {
+        const dist = Math.sqrt(Math.pow(x - fire.position.x, 2) + Math.pow(z - fire.position.z, 2));
+        if (dist <= fire.warmthRadius) {
+          return { fire, warmthFactor: 1 - (dist / fire.warmthRadius) };
+        }
+      }
+      return null;
+    };
+
+    // Check if near objective item
+    const checkNearObjective = (x, z) => {
+      if (!game.objectives.items) return null;
+      for (const item of game.objectives.items) {
+        if (item.collected) continue;
+        const dist = Math.sqrt(Math.pow(x - item.position.x, 2) + Math.pow(z - item.position.z, 2));
+        if (dist < 2) return item;
+      }
+      return null;
+    };
+
+    // Check if in escape zone
+    const checkInEscapeZone = (x, z) => {
+      if (!game.objectives.escapeActive || !game.objectives.escapeZone) return false;
+      const zone = game.objectives.escapeZone;
+      const dist = Math.sqrt(Math.pow(x - zone.position.x, 2) + Math.pow(z - zone.position.z, 2));
+      return dist <= zone.radius;
+    };
+
+    // Check glass zones
+    const checkGlassZone = (x, z) => {
+      for (const prop of mapData.props) {
+        if (prop.type === 'glass_zone' && !prop.broken) {
+          const dist = Math.sqrt(Math.pow(x - prop.position.x, 2) + Math.pow(z - prop.position.z, 2));
+          if (dist < prop.radius) return prop;
+        }
+      }
+      return null;
+    };
+
+    // Find nearby loot container
+    const checkNearLootContainer = (x, z) => {
+      for (const container of mapData.lootContainers) {
+        const state = game.lootContainerStates.get(container.id);
+        if (state && state.looted) continue;
+        const dist = Math.sqrt(Math.pow(x - container.position.x, 2) + Math.pow(z - container.position.z, 2));
+        if (dist < 2.5) return container;
+      }
+      return null;
+    };
+
     const handleKeyDown = (e) => {
-      // Chat input handling
       if (chatFocused) {
         if (e.code === 'Escape') {
           chatFocused = false;
@@ -315,7 +405,6 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         return;
       }
       
-      // Open chat with T
       if (e.code === 'KeyT' && !escapeMenuOpen && !perkSelectionOpen) {
         e.preventDefault();
         if (document.pointerLockElement) document.exitPointerLock();
@@ -348,17 +437,30 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
       keys[e.code] = true;
       if (e.code === 'Digit1') { game.activeSlot = 0; createGunModel(game.weapons[0]); }
       if (e.code === 'Digit2' && game.weapons[1]) { game.activeSlot = 1; createGunModel(game.weapons[1]); }
+      
+      // E key for interactions
       if (e.code === 'KeyE') {
-        lootContainers.forEach(container => {
-          if (!container.userData.looted && container.position.distanceTo(game.position) < 2.5) {
-            container.userData.looted = true;
-            container.material.color.setHex(0x1a2a1a);
-            socket.emit('lootContainer', { gameId: gameData.gameId, loot: container.userData.loot });
-            audioManager.playPickup('weapon');
-            const cfg = PICKUP_CONFIG[container.userData.loot];
-            game.notifications.push({ id: Date.now(), text: `Found ${cfg?.name || container.userData.loot}!`, icon: cfg?.icon || '📦', type: 'loot', expires: Date.now() + 3000 });
-          }
-        });
+        // Check loot containers
+        const nearContainer = checkNearLootContainer(game.position.x, game.position.z);
+        if (nearContainer) {
+          socket.emit('lootContainer', { gameId: gameData.gameId, containerId: nearContainer.id });
+          audioManager.playPickup('weapon');
+          return;
+        }
+        
+        // Check objectives
+        const nearObjective = checkNearObjective(game.position.x, game.position.z);
+        if (nearObjective) {
+          socket.emit('collectObjective', { gameId: gameData.gameId, objectiveId: nearObjective.id });
+          audioManager.playPickup('generic');
+          return;
+        }
+        
+        // Check escape zone
+        if (checkInEscapeZone(game.position.x, game.position.z)) {
+          socket.emit('attemptEscape', { gameId: gameData.gameId });
+          return;
+        }
       }
     };
     
@@ -473,8 +575,30 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
       }
       
       game.level = state.level;
-      game.levelName = LEVEL_NAMES[Math.min(state.level - 1, LEVEL_NAMES.length - 1)];
+      game.levelName = mapData.area?.name || 'Skid Row';
       game.allPlayers = state.players;
+      
+      // Update objectives
+      if (state.objectives) {
+        game.objectives = state.objectives;
+        setObjectives(state.objectives);
+        
+        // Update map renderer if escape zone activated
+        if (state.objectives.escapeActive && mapRendererRef.current) {
+          mapRendererRef.current.activateEscapeZone();
+        }
+      }
+      
+      // Update loot container states
+      if (state.lootContainerStates) {
+        state.lootContainerStates.forEach(container => {
+          game.lootContainerStates.set(container.id, container);
+          if (container.looted && mapRendererRef.current) {
+            mapRendererRef.current.updateLootContainer(container.id, true);
+          }
+        });
+      }
+      
       game.minimapData = {
         enemies: state.enemies.map(e => ({ x: e.position.x, z: e.position.z, type: e.type })),
         pickups: state.pickups.map(p => ({ x: p.position.x, z: p.position.z })),
@@ -482,16 +606,14 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         pings: state.pings || []
       };
 
-      // Store enemy data with identity for targeting
       game.enemies.clear();
       state.enemies.forEach(e => game.enemies.set(e.id, e));
 
-      // Update chat messages from server
       if (state.chatMessages) {
         setChatMessages(state.chatMessages);
       }
 
-      // Update meshes
+      // Update player meshes
       const seenPlayers = new Set();
       state.players.forEach(p => {
         if (p.id === playerId) return;
@@ -516,6 +638,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         if (!seenPlayers.has(id)) { scene.remove(mesh); playerMeshes.delete(id); }
       }
 
+      // Update enemy meshes
       const seenEnemies = new Set();
       state.enemies.forEach(e => {
         seenEnemies.add(e.id);
@@ -548,6 +671,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         if (!seenEnemies.has(id)) { scene.remove(mesh); enemyMeshes.delete(id); }
       }
 
+      // Update pickup meshes
       const seenPickups = new Set();
       state.pickups.forEach(p => {
         seenPickups.add(p.id);
@@ -565,6 +689,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         if (!seenPickups.has(id)) { scene.remove(mesh); pickupMeshes.delete(id); }
       }
 
+      // Update bullet meshes
       const seenBullets = new Set();
       (state.bullets || []).forEach(b => {
         seenBullets.add(b.id);
@@ -608,6 +733,42 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
       }
     };
 
+    const handleContainerLooted = (data) => {
+      game.lootContainerStates.set(data.containerId, { looted: true });
+      if (mapRendererRef.current) {
+        mapRendererRef.current.updateLootContainer(data.containerId, true);
+      }
+      if (data.playerId === playerId && data.loot) {
+        const cfg = PICKUP_CONFIG[data.loot];
+        game.notifications.push({ id: Date.now(), text: `Found ${cfg?.name || data.loot}!`, icon: cfg?.icon || '📦', type: 'loot', expires: Date.now() + 3000 });
+      }
+    };
+
+    const handleObjectiveCollected = (data) => {
+      game.objectives = data.objectives;
+      setObjectives(data.objectives);
+      
+      if (mapRendererRef.current) {
+        mapRendererRef.current.updateObjectiveCollected(data.objectiveId);
+        if (data.objectives.escapeActive) {
+          mapRendererRef.current.activateEscapeZone();
+        }
+      }
+      
+      if (data.playerId === playerId) {
+        game.notifications.push({ id: Date.now(), text: 'Objective collected!', icon: '📦', type: 'success', expires: Date.now() + 3000 });
+      }
+    };
+
+    const handleGlassBroken = (data) => {
+      if (mapRendererRef.current && data.glassId) {
+        mapRendererRef.current.breakGlassZone(data.glassId);
+      }
+      // Update local prop state
+      const prop = mapData.props.find(p => p.id === data.glassId);
+      if (prop) prop.broken = true;
+    };
+
     const handleEnemyHit = (data) => {
       audioManager.playImpact(data.isHeadshot);
       if (data.isHeadshot) {
@@ -638,7 +799,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         audioManager.playRevive();
         game.notifications.push({ id: Date.now(), text: 'You have been revived!', icon: '❤️', type: 'success', expires: Date.now() + 3000 });
       } else {
-        game.notifications.push({ id: Date.now(), text: `${data.reviverName} revived ${data.playerName}!`, icon: '⚕️', type: 'success', expires: Date.now() + 3000 });
+        game.notifications.push({ id: Date.now(), text: `${data.playerName} was revived!`, icon: '⚕️', type: 'success', expires: Date.now() + 3000 });
       }
     };
 
@@ -662,17 +823,29 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
 
     const handleEnemyAggro = (data) => { audioManager.playEnemyAggro(data.type); };
 
+    const handlePlayerEscaped = (data) => {
+      if (data.playerId === playerId) {
+        game.notifications.push({ id: Date.now(), text: 'YOU ESCAPED!', icon: '🎉', type: 'success', expires: Date.now() + 5000 });
+      } else {
+        game.notifications.push({ id: Date.now(), text: `${data.playerName} escaped!`, icon: '🚗', type: 'success', expires: Date.now() + 3000 });
+      }
+    };
+
     socket.on('gameState', handleGameState);
     socket.on('chatMessage', handleChatMessage);
     socket.on('levelUp', handleLevelUp);
     socket.on('killFeed', handleKillFeed);
     socket.on('pickupCollected', handlePickupCollected);
+    socket.on('containerLooted', handleContainerLooted);
+    socket.on('objectiveCollected', handleObjectiveCollected);
+    socket.on('glassBroken', handleGlassBroken);
     socket.on('enemyHit', handleEnemyHit);
     socket.on('playerDamaged', handlePlayerDamaged);
     socket.on('playerDowned', handlePlayerDowned);
     socket.on('playerRevived', handlePlayerRevived);
     socket.on('ping', handlePing);
     socket.on('enemyAggro', handleEnemyAggro);
+    socket.on('playerEscaped', handlePlayerEscaped);
 
     // HUD Update interval
     hudUpdateRef.current = setInterval(() => {
@@ -697,17 +870,21 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         showLevelUp: game.showLevelUp,
         playerPosition: game.position.clone(),
         playerYaw: game.yaw,
-        radarRange: game.radarRange
+        radarRange: game.radarRange,
+        isInsideBuilding: game.isInsideBuilding,
+        objectives: game.objectives
       });
     }, 100);
 
     // Game loop
     let frameCount = 0;
     let animationId;
+    const clock = new THREE.Clock();
 
     const animate = () => {
       animationId = requestAnimationFrame(animate);
       frameCount++;
+      const elapsedTime = clock.getElapsedTime();
 
       if (!escapeMenuOpen && !perkSelectionOpen && !chatFocused) {
         const moveSpeed = game.isDowned ? 0.03 : 0.12 * game.speedMult;
@@ -728,43 +905,55 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
           moveVector.normalize().multiplyScalar(finalSpeed);
           const cosYaw = Math.cos(game.yaw);
           const sinYaw = Math.sin(game.yaw);
-          game.position.x += moveVector.x * cosYaw + moveVector.z * sinYaw;
-          game.position.z += -moveVector.x * sinYaw + moveVector.z * cosYaw;
-          game.position.x = Math.max(-70, Math.min(70, game.position.x));
-          game.position.z = Math.max(-70, Math.min(70, game.position.z));
+          const desiredX = game.position.x + moveVector.x * cosYaw + moveVector.z * sinYaw;
+          const desiredZ = game.position.z + -moveVector.x * sinYaw + moveVector.z * cosYaw;
+          
+          // Apply collision with wall sliding
+          const newPos = moveWithCollision(game.position.x, game.position.z, desiredX, desiredZ);
+          game.position.x = newPos.x;
+          game.position.z = newPos.z;
 
+          // Footstep sounds and glass breaking
           footstepTimer++;
           if (footstepTimer >= (isSprinting ? 15 : 25)) {
             footstepTimer = 0;
-            let onGlass = false;
-            glassZones.forEach(zone => {
-              const dist = Math.sqrt(Math.pow(game.position.x - zone.position.x, 2) + Math.pow(game.position.z - zone.position.z, 2));
-              if (dist < zone.radius) {
-                onGlass = true;
-                if (!zone.broken) {
-                  zone.broken = true;
-                  zone.mesh.material.opacity = 0.1;
-                  audioManager.playGlassBreak();
-                  socket.emit('glassBreak', { gameId: gameData.gameId, position: { x: zone.position.x, z: zone.position.z } });
-                }
+            const glassZone = checkGlassZone(game.position.x, game.position.z);
+            if (glassZone) {
+              if (!glassZone.broken) {
+                glassZone.broken = true;
+                audioManager.playGlassBreak();
+                socket.emit('glassBreak', { gameId: gameData.gameId, glassId: glassZone.id, position: { x: glassZone.position.x, z: glassZone.position.z } });
               }
-            });
-            audioManager.playFootstep(onGlass);
+              audioManager.playFootstep(true);
+            } else {
+              audioManager.playFootstep(false);
+            }
           }
         }
 
+        // Weapon sway
         if (moveVector.length() > 0 && !game.isDowned) {
           gunGroup.position.y = -0.2 + Math.sin(frameCount * 0.15) * 0.015;
           gunGroup.position.x = 0.25 + Math.cos(frameCount * 0.075) * 0.008;
         }
         gunGroup.rotation.x *= 0.9;
 
-        firePits.forEach(f => {
-          const dist = game.position.distanceTo(f.position);
-          if (dist < 5 && frameCount % 60 === 0) game.warmth = Math.min(100, game.warmth + 2);
-          if (dist < 1.5 && frameCount % 30 === 0) socket.emit('playerHit', { gameId: gameData.gameId, damage: 5, source: 'fire' });
-        });
+        // Check if inside building (for warmth bonus indicator)
+        const interior = checkInsideBuilding(game.position.x, game.position.z);
+        game.isInsideBuilding = !!interior;
 
+        // Check barrel fires for warmth
+        const nearFire = checkNearBarrelFire(game.position.x, game.position.z);
+        if (nearFire && frameCount % 60 === 0) {
+          game.warmth = Math.min(100, game.warmth + 2 * nearFire.warmthFactor);
+        }
+        
+        // Fire damage if too close
+        if (nearFire && nearFire.warmthFactor > 0.8 && frameCount % 30 === 0) {
+          socket.emit('playerHit', { gameId: gameData.gameId, damage: 5, source: 'fire' });
+        }
+
+        // Pickup collection
         for (const [pickupId] of pickupMeshes) {
           const mesh = pickupMeshes.get(pickupId);
           if (mesh && mesh.position.distanceTo(game.position) < 1.5) {
@@ -772,6 +961,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
           }
         }
 
+        // Revive other players
         if (keys['KeyE'] && !game.isDowned) {
           let revivingPlayer = null;
           for (const p of game.allPlayers) {
@@ -787,7 +977,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
             const reviveSpeed = game.selectedPerks.some(p => p.id === 'revive_boost') ? 0.5 : 1;
             game.reviveProgress += 1 / (300 * reviveSpeed);
             if (game.reviveProgress >= 1) {
-              socket.emit('revivePlayer', { gameId: gameData.gameId, targetId: revivingPlayer, reviverId: playerId });
+              socket.emit('revivePlayer', { gameId: gameData.gameId, targetId: revivingPlayer });
               game.reviveProgress = 0;
             }
           } else {
@@ -797,6 +987,7 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
           game.reviveProgress = 0;
         }
 
+        // Send position to server
         if (frameCount % 3 === 0) {
           socket.emit('playerInput', {
             gameId: gameData.gameId,
@@ -835,15 +1026,19 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
         }
       }
 
+      // Update camera position
       camera.position.copy(game.position);
       if (game.isDowned) camera.position.y = 0.5;
       camera.rotation.order = 'YXZ';
       camera.rotation.y = game.yaw;
       camera.rotation.x = game.pitch;
 
-      flickerLights.forEach(l => { l.intensity = (l.userData.base + Math.sin(frameCount * l.userData.speed + l.userData.phase) * 0.15) * settings.brightness; });
-      firePits.forEach(f => { f.light.intensity = (0.8 + Math.sin(frameCount * 0.2) * 0.3 + Math.random() * 0.2) * settings.brightness; });
+      // Update map animations (barrel fire flicker, objective float)
+      if (mapRendererRef.current) {
+        mapRendererRef.current.updateAnimations(elapsedTime);
+      }
 
+      // Update ping visuals
       for (const [, mesh] of pingMeshes) {
         const age = (Date.now() - mesh.userData.createdAt) / 1000;
         if (mesh.children[0]) { mesh.children[0].scale.set(1 + age * 0.5, 1 + age * 0.5, 1); mesh.children[0].material.opacity = 1 - age / 5; }
@@ -879,18 +1074,27 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
       socket.off('levelUp', handleLevelUp);
       socket.off('killFeed', handleKillFeed);
       socket.off('pickupCollected', handlePickupCollected);
+      socket.off('containerLooted', handleContainerLooted);
+      socket.off('objectiveCollected', handleObjectiveCollected);
+      socket.off('glassBroken', handleGlassBroken);
       socket.off('enemyHit', handleEnemyHit);
       socket.off('playerDamaged', handlePlayerDamaged);
       socket.off('playerDowned', handlePlayerDowned);
       socket.off('playerRevived', handlePlayerRevived);
       socket.off('ping', handlePing);
       socket.off('enemyAggro', handleEnemyAggro);
+      socket.off('playerEscaped', handlePlayerEscaped);
       audioManager.stopMusic();
       if (document.pointerLockElement) document.exitPointerLock();
+      if (mapRendererRef.current) mapRendererRef.current.dispose();
       if (mount && renderer.domElement.parentNode === mount) mount.removeChild(renderer.domElement);
       renderer.dispose();
     };
-  }, [gameData, playerId, socket, handleSelectPerk, settings.theme, settings.brightness]);
+  }, [gameData, playerId, socket, handleSelectPerk, settings.brightness]);
+
+  // Calculate collected objectives count
+  const collectedCount = objectives.items?.filter(i => i.collected).length || 0;
+  const totalCount = objectives.items?.length || 0;
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -920,6 +1124,44 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
           playerYaw={hudState.playerYaw}
           radarRange={hudState.radarRange}
         />
+      )}
+
+      {/* Objective Tracker */}
+      {isLocked && !showEscapeMenu && !showPerkSelection && (
+        <div style={{
+          position: 'absolute',
+          top: 100,
+          left: 15,
+          background: 'rgba(0,0,0,0.7)',
+          borderRadius: 8,
+          padding: '10px 15px',
+          border: '1px solid rgba(255,215,0,0.3)',
+          zIndex: 60
+        }}>
+          <div style={{ color: '#ffd700', fontWeight: 'bold', fontSize: '0.9rem', marginBottom: 8 }}>
+            📋 OBJECTIVES
+          </div>
+          <div style={{ fontSize: '0.8rem', color: '#ddd', marginBottom: 4 }}>
+            <span style={{ color: collectedCount === totalCount ? '#4f4' : '#fff' }}>
+              Generator Parts: {collectedCount}/{totalCount}
+            </span>
+          </div>
+          {objectives.escapeActive ? (
+            <div style={{ fontSize: '0.8rem', color: '#4f4', marginTop: 8 }}>
+              ✅ Escape vehicle ready!<br/>
+              <span style={{ color: '#888', fontSize: '0.75rem' }}>Go to the extraction point</span>
+            </div>
+          ) : (
+            <div style={{ fontSize: '0.75rem', color: '#888', marginTop: 4 }}>
+              Collect all parts to unlock escape
+            </div>
+          )}
+          {hudState?.isInsideBuilding && (
+            <div style={{ fontSize: '0.75rem', color: '#88ccff', marginTop: 8 }}>
+              🏠 Indoors (warmth +)
+            </div>
+          )}
+        </div>
       )}
 
       {/* Targeted Enemy Name Tag */}
@@ -1116,17 +1358,6 @@ function Game({ socket, gameData, playerId, playerName, onQuit }) {
               <h3 style={{ color: '#888', fontSize: '0.9rem', marginBottom: 12 }}>DISPLAY</h3>
               <SettingSlider label="Brightness" value={settings.brightness} onChange={v => setSettings(s => ({ ...s, brightness: v }))} min={0.3} max={1.5} />
             </div>
-            <div style={styles.settingsSection}>
-              <h3 style={{ color: '#888', fontSize: '0.9rem', marginBottom: 12 }}>THEME</h3>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
-                {Object.entries(THEMES).map(([key, theme]) => (
-                  <button key={key} onClick={() => setSettings(s => ({ ...s, theme: key }))} style={{ ...styles.themeButton, borderColor: settings.theme === key ? '#ffd700' : '#444', background: settings.theme === key ? 'rgba(255,215,0,0.1)' : 'rgba(0,0,0,0.5)' }}>
-                    <div style={{ width: 24, height: 24, borderRadius: 4, background: `#${theme.sky.toString(16).padStart(6, '0')}`, border: '1px solid #555', marginBottom: 4 }} />
-                    <span style={{ fontSize: '0.7rem' }}>{theme.name}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
             <button onClick={handleQuit} style={{ ...styles.menuButton, background: 'rgba(255,50,50,0.2)', borderColor: '#f44', marginTop: 20 }}>🚪 Quit to Menu</button>
             <p style={{ color: '#555', fontSize: '0.75rem', marginTop: 20 }}>Press ESC to close</p>
           </div>
@@ -1164,8 +1395,7 @@ const styles = {
   escapeOverlay: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 300, pointerEvents: 'auto' },
   escapeMenu: { background: 'linear-gradient(135deg, #1a1a2e, #0a0a1a)', border: '2px solid #333', borderRadius: 16, padding: '30px 40px', minWidth: 350, maxWidth: 400, textAlign: 'center' },
   menuButton: { display: 'block', width: '100%', padding: '14px 20px', margin: '8px 0', background: 'rgba(255,255,255,0.05)', border: '2px solid #444', borderRadius: 8, color: 'white', fontSize: '1rem', cursor: 'pointer', transition: 'all 0.2s' },
-  settingsSection: { margin: '20px 0', padding: '15px', background: 'rgba(0,0,0,0.3)', borderRadius: 10, textAlign: 'left' },
-  themeButton: { display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '8px 12px', border: '2px solid #444', borderRadius: 8, background: 'rgba(0,0,0,0.5)', cursor: 'pointer', transition: 'all 0.2s', color: 'white' }
+  settingsSection: { margin: '20px 0', padding: '15px', background: 'rgba(0,0,0,0.3)', borderRadius: 10, textAlign: 'left' }
 };
 
 export default Game;
